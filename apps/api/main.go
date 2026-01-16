@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sort"
 	"strings"
@@ -61,6 +62,18 @@ func main() {
 		r.Post("/containers/{id}/stop", handleDockerAction("stop"))
 		r.Post("/containers/{id}/restart", handleDockerAction("restart"))
 		r.Get("/containers/{id}/logs/stream", handleDockerLogsStream)
+	})
+
+	// Production (Compose Projekte in /home/l/Production)
+	r.Route("/api/production", func(r chi.Router) {
+		r.Get("/projects", handleProductionProjects)
+		r.Get("/projects/{name}/compose", handleProductionComposeFile)
+		r.Get("/projects/{name}/env", handleProductionEnvFile)
+
+		r.Post("/projects/{name}/pull", handleProductionAction("pull"))
+		r.Post("/projects/{name}/up", handleProductionAction("up"))
+		r.Post("/projects/{name}/down", handleProductionAction("down"))
+		r.Post("/projects/{name}/restart", handleProductionAction("restart"))
 	})
 
 	addr := "127.0.0.1:9069"
@@ -263,6 +276,222 @@ func handleDockerLogsStream(w http.ResponseWriter, r *http.Request) {
 	// client disconnected or container stopped
 }
 
+// ===== Production / Compose manager =====
+
+const productionRoot = "/home/l/Production"
+
+type ProductionProjectDTO struct {
+	Name           string `json:"name"`
+	Path           string `json:"path"`
+	HasEnv         bool   `json:"hasEnv"`
+	ContainerTotal int    `json:"containerTotal"`
+	ContainerRun   int    `json:"containerRun"`
+	ContainerStop  int    `json:"containerStop"`
+}
+
+func handleProductionProjects(w http.ResponseWriter, r *http.Request) {
+	entries, err := os.ReadDir(productionRoot)
+	if err != nil {
+		httpError(w, fmt.Errorf("read production root: %w", err), http.StatusInternalServerError)
+		return
+	}
+
+	// get docker containers once and aggregate by compose project label
+	composeStats := map[string]struct {
+		total int
+		run   int
+		stop  int
+	}{}
+
+	cli, ctx, cancel, err := dockerClient(r)
+	if err == nil {
+		defer cancel()
+		defer cli.Close()
+		list, derr := cli.ContainerList(ctx, container.ListOptions{All: true})
+		if derr == nil {
+			for _, c := range list {
+				p := c.Labels["com.docker.compose.project"]
+				if p == "" {
+					continue
+				}
+				s := composeStats[p]
+				s.total++
+				if c.State == "running" {
+					s.run++
+				} else {
+					s.stop++
+				}
+				composeStats[p] = s
+			}
+		}
+	}
+
+	out := make([]ProductionProjectDTO, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// hide dot-prefixed folders (your rule)
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+
+		dir := productionRoot + "/" + name
+		composePath := dir + "/docker-compose.yml"
+
+		if _, err := os.Stat(composePath); err != nil {
+			// only include dirs with docker-compose.yml
+			continue
+		}
+
+		_, envErr := os.Stat(dir + "/.env")
+		stats := composeStats[name]
+
+		out = append(out, ProductionProjectDTO{
+			Name:           name,
+			Path:           dir,
+			HasEnv:         envErr == nil,
+			ContainerTotal: stats.total,
+			ContainerRun:   stats.run,
+			ContainerStop:  stats.stop,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	writeJSON(w, http.StatusOK, out)
+}
+
+func handleProductionComposeFile(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	dir := productionRoot + "/" + name
+
+	if strings.HasPrefix(name, ".") {
+		httpError(w, fmt.Errorf("not found"), http.StatusNotFound)
+		return
+	}
+
+	path := dir + "/docker-compose.yml"
+	b, err := os.ReadFile(path)
+	if err != nil {
+		httpError(w, fmt.Errorf("read compose file: %w", err), http.StatusNotFound)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name": name,
+		"path": path,
+		"text": string(b),
+	})
+}
+
+func handleProductionEnvFile(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	dir := productionRoot + "/" + name
+
+	if strings.HasPrefix(name, ".") {
+		httpError(w, fmt.Errorf("not found"), http.StatusNotFound)
+		return
+	}
+
+	path := dir + "/.env"
+	b, err := os.ReadFile(path)
+	if err != nil {
+		httpError(w, fmt.Errorf("read .env: %w", err), http.StatusNotFound)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name": name,
+		"path": path,
+		"text": string(b),
+	})
+}
+
+func handleProductionAction(action string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := chi.URLParam(r, "name")
+		if name == "" || strings.HasPrefix(name, ".") {
+			httpError(w, fmt.Errorf("invalid project"), http.StatusBadRequest)
+			return
+		}
+		dir := productionRoot + "/" + name
+		composePath := dir + "/docker-compose.yml"
+
+		if _, err := os.Stat(composePath); err != nil {
+			httpError(w, fmt.Errorf("compose not found: %s", composePath), http.StatusNotFound)
+			return
+		}
+
+		// Keep actions bounded (avoid hanging forever)
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+		defer cancel()
+
+		var args []string
+		switch action {
+		case "pull":
+			// Step 1: pull latest images
+			pullCmd := execCommandContext(ctx, "docker",
+				"compose", "-f", "docker-compose.yml", "pull",
+			)
+			pullCmd.Dir = dir
+
+			pullOut, err := pullCmd.CombinedOutput()
+			if err != nil {
+				httpError(w, fmt.Errorf("pull failed: %v\n%s", err, string(pullOut)), http.StatusInternalServerError)
+				return
+			}
+
+			// Step 2: recreate containers with latest images
+			upCmd := execCommandContext(ctx, "docker",
+				"compose", "-f", "docker-compose.yml", "up",
+				"-d", "--force-recreate",
+			)
+			upCmd.Dir = dir
+
+			upOut, err := upCmd.CombinedOutput()
+			if err != nil {
+				httpError(w, fmt.Errorf("recreate failed: %v\n%s", err, string(upOut)), http.StatusInternalServerError)
+				return
+			}
+
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":      true,
+				"action":  "pull-recreate",
+				"project": name,
+				"output":  string(pullOut) + "\n---\n" + string(upOut),
+			})
+			return
+		case "up":
+			args = []string{"compose", "-f", "docker-compose.yml", "up", "-d"}
+		case "down":
+			args = []string{"compose", "-f", "docker-compose.yml", "down"}
+		case "restart":
+			args = []string{"compose", "-f", "docker-compose.yml", "restart"}
+		default:
+			httpError(w, fmt.Errorf("unknown action"), http.StatusBadRequest)
+			return
+		}
+
+		// Run in project dir so relative paths + env files behave like you expect
+		cmd := execCommandContext(ctx, "docker", args...)
+		cmd.Dir = dir
+
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			httpError(w, fmt.Errorf("%s failed: %v\n%s", action, err, string(out)), http.StatusInternalServerError)
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      true,
+			"action":  action,
+			"project": name,
+			"output":  string(out),
+		})
+	}
+}
+
 func sanitizeDockerLogLine(b []byte) string {
 	// Docker mux header can appear as: 8-byte header then payload
 	// We do a cheap heuristic: if first bytes look like mux header, skip 8.
@@ -291,3 +520,5 @@ func httpError(w http.ResponseWriter, err error, status int) {
 		"error": err.Error(),
 	})
 }
+
+var execCommandContext = exec.CommandContext

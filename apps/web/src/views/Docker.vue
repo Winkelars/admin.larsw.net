@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
+import { useRouter } from "vue-router";
 import { apiGet, apiPost } from "../lib/api";
 
 type Container = {
@@ -16,6 +17,8 @@ const loading = ref(true);
 const error = ref<string | null>(null);
 const containers = ref<Container[]>([]);
 const selected = ref<Container | null>(null);
+
+const router = useRouter();
 
 const logs = ref<string>("");
 const logsError = ref<string | null>(null);
@@ -96,7 +99,20 @@ onUnmounted(() => { if (es) es.close(); });
       <div v-for="[group, list] in grouped" :key="group" class="group">
         <div class="groupTitle">
           <span class="gname">{{ group }}</span>
-          <span class="gcount">{{ list.length }}</span>
+
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span class="gcount">{{ list.length }}</span>
+
+            <template v-if="group !== 'ungrouped'">
+              <button class="btn2" @click="router.push({ path: '/production', query: { project: group } })">
+                Compose
+              </button>
+              <button class="btn"
+                @click="apiPost(`/api/production/projects/${encodeURIComponent(group)}/pull`).then(refresh).catch(e => alert(e))">
+                Pull
+              </button>
+            </template>
+          </div>
         </div>
 
         <div v-for="c in list" :key="c.id" class="card">

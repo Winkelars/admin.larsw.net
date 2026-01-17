@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "npx concurrently 'cd /home/l/vps-admin-gui/apps/web && npm run dev' 'cd /home/l/vps-admin-gui/apps/api && go run .'",
     "build": "vue-tsc -b && vite build",
     "preview": "vite preview"
   },
